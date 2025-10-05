@@ -24,6 +24,8 @@ typedef struct {
     tile_t hands[MAX_PLAYERS][14]; int hand_len[MAX_PLAYERS];
     tile_t pool[28]; int pool_len;
     int turn, table_id, finished;
+    int player_count;
+    int human_player;
     pthread_mutex_t mtx; // sección crítica del estado
 } game_state_t;
 
@@ -47,6 +49,8 @@ typedef struct {
 /* ===== Prototipos ===== */
 // Utilidades
 static void shuffle(tile_t *v, int n);
+static void build_shuffled_deck(tile_t *deck, int *out_len);
+static void setup_game_state(game_state_t *g, int table_id, int player_count, int human_player);
 static int  can_play(const game_state_t *g, int pid, tile_t *out, int *side);
 static int  draw_from_pool(game_state_t *g, int pid);
 // Cola de movimientos (mutex + cond)
@@ -193,6 +197,103 @@ static void shuffle(tile_t *v, int n){
         tile_t tmp = v[i]; v[i]=v[j]; v[j]=tmp;
     }
 }
+
+static void build_shuffled_deck(tile_t *deck, int *out_len){
+    int idx = 0;
+    for(int a = 0; a <= 6; ++a){
+        for(int b = a; b <= 6; ++b){
+            deck[idx++] = (tile_t){ .a = a, .b = b };
+        }
+    }
+    *out_len = idx;
+    shuffle(deck, idx);
+}
+
+static void setup_game_state(game_state_t *g, int table_id, int player_count, int human_player){
+    tile_t deck[MAX_TILES];
+    int deck_len = 0;
+    build_shuffled_deck(deck, &deck_len);
+
+    g->table_id = table_id;
+    g->player_count = player_count;
+    g->human_player = human_player;
+    g->finished = 0;
+    g->train_len = 0;
+    g->left_end = -1;
+    g->right_end = -1;
+    g->pool_len = 0;
+    g->turn = 0;
+
+    for(int pid = 0; pid < MAX_PLAYERS; ++pid){
+        g->hand_len[pid] = 0;
+    }
+
+    int deck_pos = 0;
+    for(int pid = 0; pid < player_count; ++pid){
+        for(int j = 0; j < 7 && deck_pos < deck_len; ++j){
+            g->hands[pid][j] = deck[deck_pos++];
+        }
+        g->hand_len[pid] = 7;
+    }
+
+    for(int pid = player_count; pid < MAX_PLAYERS; ++pid){
+        g->hand_len[pid] = 0;
+    }
+
+    while(deck_pos < deck_len && g->pool_len < MAX_TILES){
+        g->pool[g->pool_len++] = deck[deck_pos++];
+    }
+
+    int start_pid = -1;
+    int start_idx = -1;
+    tile_t start_tile = {0, 0};
+    int best_double = -1;
+    for(int pid = 0; pid < player_count; ++pid){
+        for(int j = 0; j < g->hand_len[pid]; ++j){
+            tile_t t = g->hands[pid][j];
+            if(t.a == t.b && t.a > best_double){
+                best_double = t.a;
+                start_pid = pid;
+                start_idx = j;
+                start_tile = t;
+            }
+        }
+    }
+
+    if(start_pid == -1){
+        int best_sum = -1;
+        int best_high = -1;
+        for(int pid = 0; pid < player_count; ++pid){
+            for(int j = 0; j < g->hand_len[pid]; ++j){
+                tile_t t = g->hands[pid][j];
+                int sum = t.a + t.b;
+                int high = t.a > t.b ? t.a : t.b;
+                if(sum > best_sum || (sum == best_sum && high > best_high)){
+                    best_sum = sum;
+                    best_high = high;
+                    start_pid = pid;
+                    start_idx = j;
+                    start_tile = t;
+                }
+            }
+        }
+    }
+
+    if(start_pid >= 0){
+        int len = g->hand_len[start_pid];
+        for(int j = start_idx; j < len - 1; ++j){
+            g->hands[start_pid][j] = g->hands[start_pid][j + 1];
+        }
+        if(len > 0){
+            g->hand_len[start_pid] = len - 1;
+        }
+        g->train[0] = start_tile;
+        g->train_len = 1;
+        g->left_end = start_tile.a;
+        g->right_end = start_tile.b;
+        g->turn = (start_pid + 1) % player_count;
+    }
+}
 static int can_play(const game_state_t *g, int pid, tile_t *out, int *side){
     // TODO: buscar en mano[pid] una ficha que calce con left_end o right_end
     (void)g; (void)pid; (void)out; (void)side;
@@ -287,7 +388,7 @@ int main(int argc, char **argv){
 
         tbl->state = (game_state_t){0};
         pthread_mutex_init(&tbl->state.mtx, NULL);
-        tbl->state.table_id = t;
+        setup_game_state(&tbl->state, t, tbl->seats, chosen_seat);
 
         for(int i=0;i<tbl->seats;i++){
             tbl->pcbs[i].pid=i;
