@@ -1,8 +1,9 @@
 // domino.c
+#define _POSIX_C_SOURCE 199309L
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <time.h>
+#include <time.h> // Needed for clock_gettime and CLOCK_MONOTONIC
 #include <pthread.h>
 #include <unistd.h>
 #include <stdbool.h>
