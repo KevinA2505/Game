@@ -6,6 +6,7 @@
 #include <pthread.h>
 #include <unistd.h>
 #include <linux/time.h>
+#include <stdbool.h>
 
 #define MAX_PLAYERS 4
 #define MAX_TILES   28
@@ -124,7 +125,23 @@ static void *scheduler_thread(void *arg){
 }
 
 /* ===== Player thread ===== */
-typedef struct { int id; game_state_t *g; pcb_t *pcb; } player_ctx_t;
+typedef struct {
+    int id;
+    game_state_t *g;
+    pcb_t *pcb;
+    bool is_human;
+} player_ctx_t;
+
+typedef struct {
+    game_state_t state;
+    pcb_t *pcbs;
+    player_ctx_t *pctx;
+    pthread_t *player_threads;
+    pthread_t validator_thread;
+    pthread_t scheduler_thread;
+    sched_ctx_t scheduler_ctx;
+    int seats;
+} table_runtime_t;
 
 static void *player_thread(void *arg){
     player_ctx_t *cx = (player_ctx_t*)arg;
@@ -195,37 +212,115 @@ static void msleep(int ms){ usleep(ms*1000); }
 /* ===== main ===== */
 int main(int argc, char **argv){
     (void)argc; (void)argv;
-    srand((unsigned)time(NULL));
 
-    game_state_t g = {0}; pthread_mutex_init(&g.mtx, NULL);
-    g.table_id = 0;
-
-    // TODO: generar 28 fichas, barajar, repartir 7 por jugador, resto al pozo, setear extremos si hay doble inicial, etc.
-
-    // PCBs y jugadores
-    pcb_t pcbs[MAX_PLAYERS]={0};
-    player_ctx_t pctx[MAX_PLAYERS];
-    pthread_t th_players[MAX_PLAYERS];
-
-    for(int i=0;i<MAX_PLAYERS;i++){
-        pcbs[i].pid=i; pcbs[i].st=READY; pcbs[i].pol=RR;
-        pthread_mutex_init(&pcbs[i].mtx,NULL);
-        pthread_cond_init(&pcbs[i].run_cv,NULL);
-        pctx[i]=(player_ctx_t){ .id=i, .g=&g, .pcb=&pcbs[i] };
-        pthread_create(&th_players[i], NULL, player_thread, &pctx[i]);
+    int tables_count = 0;
+    while(tables_count < 1){
+        printf("Ingrese la cantidad de mesas a crear (>=1): ");
+        fflush(stdout);
+        if(scanf("%d", &tables_count) != 1){
+            int ch;
+            while((ch = getchar()) != '\n' && ch != EOF){}
+            tables_count = 0;
+            printf("Entrada inválida. Intente nuevamente.\n");
+        }else if(tables_count < 1){
+            printf("La cantidad debe ser al menos 1.\n");
+        }
     }
 
-    // HVU
-    pthread_t th_v; pthread_create(&th_v, NULL, validator_thread, &g);
+    srand((unsigned)time(NULL));
 
-    // Planificador
-    sched_ctx_t sc = { .pcbs=pcbs, .n=MAX_PLAYERS, .pol=RR, .quantum_ms=Q_DEFAULT_MS };
-    pthread_t th_s; pthread_create(&th_s, NULL, scheduler_thread, &sc);
+    table_runtime_t *tables = calloc(tables_count, sizeof(table_runtime_t));
+    if(!tables){
+        fprintf(stderr, "Error al reservar memoria para las mesas.\n");
+        return 1;
+    }
 
-    // Espera (en un prototipo simple puede unirse o bloquear hasta condición de fin)
-    pthread_join(th_s, NULL);
-    pthread_join(th_v, NULL);
-    for(int i=0;i<MAX_PLAYERS;i++) pthread_join(th_players[i], NULL);
+    moveq_init();
+
+    for(int t=0; t<tables_count; ++t){
+        table_runtime_t *tbl = &tables[t];
+        tbl->seats = rand()%3 + 2;
+
+        printf("Mesa %d: %d asientos disponibles.\n", t+1, tbl->seats);
+        bool occupy = false;
+        char opt;
+        printf("¿Desea ocupar uno de estos asientos? (s/n): ");
+        fflush(stdout);
+        if(scanf(" %c", &opt) == 1){
+            if(opt == 's' || opt == 'S'){
+                occupy = true;
+            }
+        }else{
+            int ch;
+            while((ch = getchar()) != '\n' && ch != EOF){}
+        }
+
+        int chosen_seat = -1;
+        if(occupy){
+            while(1){
+                printf("Seleccione el número de asiento (1-%d): ", tbl->seats);
+                fflush(stdout);
+                if(scanf("%d", &chosen_seat) != 1){
+                    int ch;
+                    while((ch = getchar()) != '\n' && ch != EOF){}
+                    printf("Entrada inválida. Intente nuevamente.\n");
+                    chosen_seat = -1;
+                    continue;
+                }
+                chosen_seat -= 1;
+                if(chosen_seat < 0 || chosen_seat >= tbl->seats){
+                    printf("Asiento fuera de rango. Intente nuevamente.\n");
+                    chosen_seat = -1;
+                }else{
+                    break;
+                }
+            }
+        }
+
+        tbl->pcbs = calloc(tbl->seats, sizeof(pcb_t));
+        tbl->pctx = calloc(tbl->seats, sizeof(player_ctx_t));
+        tbl->player_threads = calloc(tbl->seats, sizeof(pthread_t));
+        if(!tbl->pcbs || !tbl->pctx || !tbl->player_threads){
+            fprintf(stderr, "Error al reservar memoria para la mesa %d.\n", t+1);
+            return 1;
+        }
+
+        tbl->state = (game_state_t){0};
+        pthread_mutex_init(&tbl->state.mtx, NULL);
+        tbl->state.table_id = t;
+
+        for(int i=0;i<tbl->seats;i++){
+            tbl->pcbs[i].pid=i;
+            tbl->pcbs[i].st=READY;
+            tbl->pcbs[i].pol=RR;
+            pthread_mutex_init(&tbl->pcbs[i].mtx,NULL);
+            pthread_cond_init(&tbl->pcbs[i].run_cv,NULL);
+            tbl->pctx[i] = (player_ctx_t){ .id=i, .g=&tbl->state, .pcb=&tbl->pcbs[i], .is_human=(i==chosen_seat) };
+            pthread_create(&tbl->player_threads[i], NULL, player_thread, &tbl->pctx[i]);
+        }
+
+        pthread_create(&tbl->validator_thread, NULL, validator_thread, &tbl->state);
+
+        tbl->scheduler_ctx = (sched_ctx_t){ .pcbs=tbl->pcbs, .n=tbl->seats, .pol=RR, .quantum_ms=Q_DEFAULT_MS };
+        pthread_create(&tbl->scheduler_thread, NULL, scheduler_thread, &tbl->scheduler_ctx);
+    }
+
+    for(int t=0; t<tables_count; ++t){
+        table_runtime_t *tbl = &tables[t];
+        pthread_join(tbl->scheduler_thread, NULL);
+        pthread_join(tbl->validator_thread, NULL);
+        for(int i=0;i<tbl->seats;i++){
+            pthread_join(tbl->player_threads[i], NULL);
+        }
+    }
+
+    for(int t=0; t<tables_count; ++t){
+        table_runtime_t *tbl = &tables[t];
+        free(tbl->pcbs);
+        free(tbl->pctx);
+        free(tbl->player_threads);
+    }
+    free(tables);
 
     return 0;
 }
